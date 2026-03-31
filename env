@@ -1,0 +1,16 @@
+# Safe Vault Backend Configuration
+
+# Port
+PORT=3000
+
+# Notification settings
+NOTIFICATION_EMAIL=Kkdabby76@gmail.com
+
+# Gmail settings (for email notifications)
+GMAIL_PASSWORD=your-app-password
+
+# Company wallet (for reference)
+COMPANY_WALLET=0x018Ab1922b0275b632dd0426C48553092aE3a107
+
+# Resend API (optional alternative to Gmail)
+RESEND_API_KEY=re_UoQWoiyB_4whCC49AJZtEn8DXLCDgtjhB
